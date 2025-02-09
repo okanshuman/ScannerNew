@@ -5,8 +5,9 @@ import requests
 import pandas as pd
 import yfinance as yf
 import logging
+import datetime
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Form
 from starlette.responses import StreamingResponse, HTMLResponse
 import uvicorn
 
@@ -21,8 +22,6 @@ app = FastAPI(title="Indian Stocks Scanner API with Real-time UI")
 def get_stock_list():
     """
     Fetch the NSE equity list from the official CSV file and return a list of symbols.
-    A custom User-Agent header and timeout are set to help the request go through.
-    Optionally, known problematic tickers (e.g. delisted stocks) are filtered out.
     """
     headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     response = requests.get(NSE_CSV_URL, headers=headers, timeout=10)
@@ -30,7 +29,6 @@ def get_stock_list():
         raise Exception(f"Failed to fetch stock list. HTTP {response.status_code}")
     df = pd.read_csv(io.StringIO(response.text))
     symbols = df["SYMBOL"].dropna().unique().tolist()
-    # Optionally filter out problematic tickers known to be delisted or with missing data
     problematic = {"KALYANI", "MGL", "PHOENIXLTD", "PILANIINVS"}
     symbols = [sym for sym in symbols if sym not in problematic]
     return symbols
@@ -43,7 +41,6 @@ def chunker(seq, size):
 def get_complete_week_data(df):
     """
     Resample daily data into weeks ending on Friday.
-    If the latest week is incomplete, return the previous complete week.
     """
     weekly_df = df.resample("W-FRI").agg({"Open": "first", "Close": "last"})
     if len(weekly_df) == 0:
@@ -57,8 +54,6 @@ def get_complete_week_data(df):
 def get_complete_month_data(df):
     """
     Resample daily data into months.
-    Uses "ME" (month end) frequency to avoid deprecation warnings.
-    If the current month is incomplete, return the previous complete month.
     """
     monthly_df = df.resample("ME").agg({"Open": "first", "Close": "last"})
     if len(monthly_df) == 0:
@@ -69,23 +64,13 @@ def get_complete_month_data(df):
         return monthly_df.iloc[-2] if len(monthly_df) >= 2 else None
     return monthly_df.iloc[-1]
 
-def scan_stocks():
+def scan_stocks(target_date_str: str):
     """
-    Generator function that scans all stocks and yields Server-Sent Event (SSE) messages
-    as each stock is processed.
-    
-    Conditions applied:
-      1. latest_close >= one_week_open * 1.01  
-      2. latest_close <= one_week_open * 1.04  
-      3. latest_close > latest_open  
-      4. weekly_close > max(3, weekly_open)  
-      5. monthly_close > max(3, monthly_open)  
-      6. latest_close > max(3, latest_open)  
-      7. latest_volume >= 100000  
-      8. 100 < latest_close < 1000  
-      9. latest_close >= latest_high * 0.98  
+    Scans stocks based on conditions, using data up to the specified target date.
     """
+    start_time = time.time()
     yield "data: Starting scan of Indian stocks...\n\n"
+
     try:
         original_symbols = get_stock_list()
         yield f"data: Fetched stock list with {len(original_symbols)} symbols.\n\n"
@@ -93,21 +78,24 @@ def scan_stocks():
         yield f"data: ERROR fetching stock list: {e}\n\n"
         return
 
-    # Map each NSE symbol to its yfinance ticker (append ".NS")
     ticker_mapping = {symbol: f"{symbol}.NS" for symbol in original_symbols}
-    # Inverse mapping for logging
     inverse_mapping = {v: k for k, v in ticker_mapping.items()}
     tickers = list(ticker_mapping.values())
 
     result = []
-    batch_size = 5  # A smaller batch size helps avoid rate limits.
+    batch_size = 5
     batches = list(chunker(tickers, batch_size))
     total_batches = len(batches)
 
+    try:
+        target_date = datetime.datetime.strptime(target_date_str, "%Y-%m-%d").date()
+    except ValueError:
+        yield "data: Invalid date format. Please use YYYY-MM-DD.\n\n"
+        return
+
     for i, batch in enumerate(batches, start=1):
-        yield f"data: Processing batch {i} of {total_batches} (tickers: {len(batch)})...\n\n"
-        
-        # Retry indefinitely for rate limit errors
+        yield f"data: Processing batch {i} of {total_batches}...\n\n"
+
         while True:
             try:
                 data = yf.download(
@@ -119,21 +107,20 @@ def scan_stocks():
                     auto_adjust=False,
                     progress=False,
                 )
-                break  # Exit loop if download is successful
+                break
             except Exception as e:
                 if "Rate limited" in str(e):
-                    yield f"data: Rate limited while downloading batch {i}. Retrying after 20 seconds...\n\n"
+                    yield f"data: Rate limited on batch {i}. Retrying in 20 seconds...\n\n"
                     time.sleep(20)
                 else:
-                    yield f"data: ERROR downloading batch {i}: {e}\n\n"
+                    yield f"data: Error downloading batch {i}: {e}\n\n"
                     data = None
                     break
 
         if data is None:
-            yield f"data: Skipping batch {i} due to errors.\n\n"
+            yield f"data: Skipping batch {i} due to download errors.\n\n"
             continue
 
-        # Organize the downloaded data into a dictionary: ticker -> DataFrame.
         if len(batch) == 1:
             ticker = batch[0]
             df = data.copy()
@@ -155,10 +142,16 @@ def scan_stocks():
                 yield f"data: Skipping {original_symbol} (not enough data).\n\n"
                 continue
 
-            # Ensure the index is a DatetimeIndex and sorted.
             if not isinstance(df.index, pd.DatetimeIndex):
                 df.index = pd.to_datetime(df.index)
             df.sort_index(inplace=True)
+
+            # Filter the DataFrame to include only data up to the target date
+            df = df[df.index <= pd.to_datetime(target_date)]
+
+            if df.empty:
+                yield f"data: Skipping {original_symbol} (no data up to {target_date_str}).\n\n"
+                continue
 
             latest_date = df.index[-1]
             try:
@@ -171,7 +164,6 @@ def scan_stocks():
                 yield f"data: Error processing latest data for {original_symbol}\n\n"
                 continue
 
-            # Get the open price from roughly one week ago.
             one_week_date = latest_date - pd.Timedelta(days=7)
             df_week = df[df.index <= one_week_date]
             if df_week.empty:
@@ -180,7 +172,6 @@ def scan_stocks():
             one_week_data = df_week.iloc[-1]
             one_week_open = one_week_data["Open"]
 
-            # Get weekly and monthly complete data.
             weekly_data = get_complete_week_data(df)
             if weekly_data is None:
                 yield f"data: Skipping {original_symbol} (insufficient weekly data).\n\n"
@@ -195,15 +186,14 @@ def scan_stocks():
             monthly_open = monthly_data["Open"]
             monthly_close = monthly_data["Close"]
 
-            # Check conditions:
-            cond1 = latest_close >= one_week_open * 1.01
-            cond2 = latest_close <= one_week_open * 1.04
+            cond1 = 100 < latest_close < 1000
+            cond2 = latest_volume >= 100000
             cond3 = latest_close > latest_open
             cond4 = weekly_close > max(3, weekly_open)
             cond5 = monthly_close > max(3, monthly_open)
             cond6 = latest_close > max(3, latest_open)
-            cond7 = latest_volume >= 100000
-            cond8 = (latest_close > 100) and (latest_close < 1000)
+            cond7 = latest_close <= one_week_open * 1.04
+            cond8 = latest_close >= one_week_open * 1.01
             cond9 = latest_close >= latest_high * 0.98
 
             if all([cond1, cond2, cond3, cond4, cond5, cond6, cond7, cond8, cond9]):
@@ -212,15 +202,18 @@ def scan_stocks():
 
         yield f"data: Completed batch {i}.\n\n"
 
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    formatted_time = str(datetime.timedelta(seconds=elapsed_time))
+
     yield f"data: Finished scanning. Total matching stocks: {len(result)}\n\n"
     yield f"data: Final Result: {result}\n\n"
+    yield f"data: Total Time taken: {formatted_time}\n\n"
+
 
 @app.get("/", response_class=HTMLResponse)
 def get_ui():
-    """
-    Serves a simple HTML page with a button to start the scan and a log area that displays
-    real-time processing details.
-    """
+    """Serves the HTML page with a date input and start button."""
     html_content = """
     <!DOCTYPE html>
     <html>
@@ -230,18 +223,26 @@ def get_ui():
          body { font-family: Arial, sans-serif; margin: 20px; }
          #log { border: 1px solid #ccc; padding: 10px; height: 400px; overflow-y: scroll; background: #f9f9f9; }
          button { padding: 10px 20px; font-size: 16px; }
+         input[type="date"] { padding: 8px; font-size: 14px; }
       </style>
     </head>
     <body>
       <h1>Indian Stocks Scanner - Real-time Processing</h1>
+      <label for="targetDate">Select Target Date:</label>
+      <input type="date" id="targetDate" name="targetDate">
       <button onclick="startScan()">Start Scan</button>
       <h2>Processing Log:</h2>
       <div id="log"></div>
       <script>
         var evtSource;
         function startScan() {
+          var targetDate = document.getElementById("targetDate").value;
+          if (!targetDate) {
+            alert("Please select a target date.");
+            return;
+          }
           document.getElementById("log").innerHTML = "";
-          evtSource = new EventSource("/stream");
+          evtSource = new EventSource("/stream?target_date=" + targetDate);
           evtSource.onmessage = function(event) {
             var logDiv = document.getElementById("log");
             logDiv.innerHTML += event.data + "<br>";
@@ -258,12 +259,14 @@ def get_ui():
     """
     return html_content
 
+
 @app.get("/stream")
-def stream():
+def stream(target_date: str):
     """
-    SSE endpoint that streams real-time processing details as the scan runs.
+    Streams stock scan results based on the provided target date.
     """
-    return StreamingResponse(scan_stocks(), media_type="text/event-stream")
+    return StreamingResponse(scan_stocks(target_date), media_type="text/event-stream")
+
 
 if __name__ == "__main__":
-      uvicorn.run(app, host="0.0.0.0", port=5005)
+    uvicorn.run(app, host="0.0.0.0", port=5005)
