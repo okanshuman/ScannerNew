@@ -199,6 +199,7 @@ def scan_stocks(target_date_str: str):
             if all([cond1, cond2, cond3, cond4, cond5, cond6, cond7, cond8, cond9]):
                 result.append(original_symbol)
                 yield f"data: {original_symbol} meets conditions.\n\n"
+                yield f"data: MATCH: {original_symbol}\n\n" # Display as soon as a match is found
 
         yield f"data: Completed batch {i}.\n\n"
 
@@ -222,6 +223,7 @@ def get_ui():
       <style>
          body { font-family: Arial, sans-serif; margin: 20px; }
          #log { border: 1px solid #ccc; padding: 10px; height: 400px; overflow-y: scroll; background: #f9f9f9; }
+         #matches { border: 1px solid green; padding: 10px; height: 200px; overflow-y: scroll; background: #e9f9e9; margin-top: 20px; }
          button { padding: 10px 20px; font-size: 16px; }
          input[type="date"] { padding: 8px; font-size: 14px; }
       </style>
@@ -233,6 +235,8 @@ def get_ui():
       <button onclick="startScan()">Start Scan</button>
       <h2>Processing Log:</h2>
       <div id="log"></div>
+      <h2>Matching Stocks:</h2>
+      <div id="matches"></div>
       <script>
         var evtSource;
         function startScan() {
@@ -242,11 +246,19 @@ def get_ui():
             return;
           }
           document.getElementById("log").innerHTML = "";
+          document.getElementById("matches").innerHTML = ""; // Clear previous matches
           evtSource = new EventSource("/stream?target_date=" + targetDate);
           evtSource.onmessage = function(event) {
             var logDiv = document.getElementById("log");
+            var matchesDiv = document.getElementById("matches");
             logDiv.innerHTML += event.data + "<br>";
             logDiv.scrollTop = logDiv.scrollHeight;
+
+            if (event.data.startsWith("MATCH:")) {
+              var stock = event.data.substring(7); // Extract stock symbol
+              matchesDiv.innerHTML += stock + "<br>";
+              matchesDiv.scrollTop = matchesDiv.scrollHeight;
+            }
           };
           evtSource.onerror = function(err) {
             console.error("EventSource failed:", err);
